@@ -1,10 +1,8 @@
 import streamlit as st
+import cv2
 import numpy as np
 from ultralytics import YOLO
-from PIL import Image, ImageDraw
-from skimage.transform import resize, ProjectiveTransform, warp
-from skimage.measure import find_contours
-from skimage.morphology import binary_closing, binary_opening, square
+from PIL import Image
 
 MODEL_PATH = "runs/segment/ecg_seg-2/weights/best.pt"
 OUT_W = 1600
@@ -20,7 +18,7 @@ def load_model():
 
 
 def order_points(pts):
-    pts = np.array(pts, dtype=np.float32)
+    pts = np.array(pts, dtype="float32")
 
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1)
@@ -30,57 +28,22 @@ def order_points(pts):
     tr = pts[np.argmin(diff)]
     bl = pts[np.argmax(diff)]
 
-    return np.array([tl, tr, br, bl], dtype=np.float32)
+    return np.array([tl, tr, br, bl], dtype="float32")
 
 
-def get_box_from_mask(mask):
-    ys, xs = np.where(mask > 0)
-
-    if len(xs) == 0 or len(ys) == 0:
-        raise Exception("Mask rỗng")
-
-    pts = np.column_stack([xs, ys]).astype(np.float32)
-
-    # PCA lấy hình chữ nhật xoay gần giống minAreaRect
-    center = pts.mean(axis=0)
-    pts_centered = pts - center
-
-    cov = np.cov(pts_centered.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-
-    order = np.argsort(eigvals)[::-1]
-    eigvecs = eigvecs[:, order]
-
-    rotated = pts_centered @ eigvecs
-
-    min_xy = rotated.min(axis=0)
-    max_xy = rotated.max(axis=0)
-
-    corners_rotated = np.array([
-        [min_xy[0], min_xy[1]],
-        [max_xy[0], min_xy[1]],
-        [max_xy[0], max_xy[1]],
-        [min_xy[0], max_xy[1]],
-    ])
-
-    corners = corners_rotated @ eigvecs.T + center
-
-    return order_points(corners)
-
-
-def fix_ecg_orientation(img):
-    h, w = img.shape[:2]
+def fix_ecg_orientation(warp):
+    h, w = warp.shape[:2]
 
     if h > w:
-        img = np.rot90(img, k=3)
+        warp = cv2.rotate(warp, cv2.ROTATE_90_CLOCKWISE)
 
-    return img
+    return warp
 
 
-def process_ecg(img_rgb):
+def process_ecg(img_bgr):
     model = load_model()
 
-    results = model(img_rgb)
+    results = model(img_bgr)
 
     if results[0].masks is None:
         raise Exception("Không detect được ECG paper")
@@ -91,59 +54,73 @@ def process_ecg(img_rgb):
     best_area = 0
 
     for m in masks:
-        m = resize(
-            m,
-            (img_rgb.shape[0], img_rgb.shape[1]),
-            preserve_range=True,
-            anti_aliasing=False
-        )
+        m = cv2.resize(m, (img_bgr.shape[1], img_bgr.shape[0]))
+        m = (m > 0.5).astype(np.uint8) * 255
 
-        mask = m > 0.5
-        area = np.sum(mask)
+        area = cv2.countNonZero(m)
 
         if area > best_area:
             best_area = area
-            best_mask = mask
+            best_mask = m
 
     if best_mask is None:
         raise Exception("Không lấy được mask")
 
-    mask = binary_closing(best_mask, square(9))
-    mask = binary_opening(mask, square(9))
+    kernel = np.ones((9, 9), np.uint8)
+    mask = cv2.morphologyEx(best_mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    src = get_box_from_mask(mask)
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if len(contours) == 0:
+        raise Exception("Không tìm thấy contour")
+
+    cnt = max(contours, key=cv2.contourArea)
+
+    rect = cv2.minAreaRect(cnt)
+    box = cv2.boxPoints(rect)
+    box = np.array(box, dtype=np.float32)
+
+    src = order_points(box)
 
     dst = np.array([
         [0, 0],
         [OUT_W - 1, 0],
         [OUT_W - 1, OUT_H - 1],
         [0, OUT_H - 1]
-    ], dtype=np.float32)
+    ], dtype="float32")
 
-    tform = ProjectiveTransform()
-    tform.estimate(dst, src)
+    M = cv2.getPerspectiveTransform(src, dst)
+    warp = cv2.warpPerspective(img_bgr, M, (OUT_W, OUT_H))
+    warp = fix_ecg_orientation(warp)
 
-    warped = warp(
-        img_rgb,
-        tform,
-        output_shape=(OUT_H, OUT_W),
-        preserve_range=True
-    ).astype(np.uint8)
+    debug = img_bgr.copy()
 
-    warped = fix_ecg_orientation(warped)
+    cv2.drawContours(
+        debug,
+        [box.astype(np.int32)],
+        -1,
+        (0, 255, 0),
+        5
+    )
 
-    debug = Image.fromarray(img_rgb.copy())
-    draw = ImageDraw.Draw(debug)
+    for i, (x, y) in enumerate(src.astype(int)):
+        cv2.circle(debug, (x, y), 12, (0, 0, 255), -1)
+        cv2.putText(
+            debug,
+            str(i),
+            (x + 10, y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (255, 0, 0),
+            3
+        )
 
-    points = [(float(x), float(y)) for x, y in src]
-    draw.line(points + [points[0]], fill=(0, 255, 0), width=5)
-
-    for i, (x, y) in enumerate(points):
-        r = 10
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 0, 0))
-        draw.text((x + 10, y - 10), str(i), fill=(0, 0, 255))
-
-    return np.array(debug), warped
+    return debug, warp
 
 
 uploaded_file = st.file_uploader(
@@ -155,8 +132,13 @@ if uploaded_file is not None:
     image = Image.open(uploaded_file).convert("RGB")
     img_rgb = np.array(image)
 
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+
     try:
-        debug_rgb, warp_rgb = process_ecg(img_rgb)
+        debug_bgr, warp_bgr = process_ecg(img_bgr)
+
+        debug_rgb = cv2.cvtColor(debug_bgr, cv2.COLOR_BGR2RGB)
+        warp_rgb = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2RGB)
 
         col1, col2 = st.columns(2)
 
@@ -168,8 +150,7 @@ if uploaded_file is not None:
             st.subheader("Warped ECG")
             st.image(warp_rgb, use_container_width=True)
 
-        out_img = Image.fromarray(warp_rgb)
-        out_img.save("ecg_warped.jpg")
+        cv2.imwrite("ecg_warped.jpg", warp_bgr)
 
         with open("ecg_warped.jpg", "rb") as f:
             st.download_button(
