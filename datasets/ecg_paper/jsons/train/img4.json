@@ -1,0 +1,36 @@
+{
+  "version": "6.3.0",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "ecg_paper",
+      "points": [
+        [
+          2.359550561797761,
+          141.79775280898878
+        ],
+        [
+          1278.7640449438202,
+          205.8426966292135
+        ],
+        [
+          1279.887640449438,
+          481.12359550561797
+        ],
+        [
+          0.0,
+          421.6200473092844
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "shape_type": "polygon",
+      "flags": {},
+      "mask": null
+    }
+  ],
+  "imagePath": "img4.jpg",
+  "imageData": null,
+  "imageHeight": 960,
+  "imageWidth": 1280
+}

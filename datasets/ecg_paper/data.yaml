@@ -1,0 +1,9 @@
+path: datasets/ecg_paper
+
+train: images/train
+val: images/val
+
+kpt_shape: [4, 3]
+
+names:
+  0: ecg_paper
