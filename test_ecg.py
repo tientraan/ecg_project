@@ -26,14 +26,7 @@ def order_points(pts):
     return np.array([tl, tr, br, bl], dtype="float32")
 
 
-def fix_ecg_orientation(warp):
-    h, w = warp.shape[:2]
-
-    # chỉ xoay nếu ảnh đang dọc
-    if h > w:
-        warp = cv2.rotate(warp, cv2.ROTATE_90_CLOCKWISE)
-
-    return warp
+# Orientation check is now embedded inside the main logic
 
 
 model = YOLO(MODEL_PATH)
@@ -91,19 +84,43 @@ box = cv2.boxPoints(rect)
 box = np.array(box, dtype=np.float32)
 
 src = order_points(box)
+tl, tr, br, bl = src
 
+# Calculate physical width and height from the detected box to check portrait vs landscape
+width_top = np.linalg.norm(tr - tl)
+width_bottom = np.linalg.norm(br - bl)
+height_left = np.linalg.norm(bl - tl)
+height_right = np.linalg.norm(br - tr)
 
-dst = np.array([
-    [0, 0],
-    [OUT_W - 1, 0],
-    [OUT_W - 1, OUT_H - 1],
-    [0, OUT_H - 1]
-], dtype="float32")
+box_width = max(width_top, width_bottom)
+box_height = max(height_left, height_right)
 
-M = cv2.getPerspectiveTransform(src, dst)
-warp = cv2.warpPerspective(img, M, (OUT_W, OUT_H))
+is_vertical = box_height > box_width
 
-warp = fix_ecg_orientation(warp)
+if is_vertical:
+    # Map to a vertical canvas of OUT_H x OUT_W to avoid squishing
+    dst = np.array([
+        [0, 0],
+        [OUT_H - 1, 0],
+        [OUT_H - 1, OUT_W - 1],
+        [0, OUT_W - 1]
+    ], dtype="float32")
+    # Perspective Warp Transformation
+    M = cv2.getPerspectiveTransform(src, dst)
+    warp = cv2.warpPerspective(img, M, (OUT_H, OUT_W))
+    # Rotate 90 degrees counter-clockwise to make it horizontal
+    warp = cv2.rotate(warp, cv2.ROTATE_90_COUNTERCLOCKWISE)
+else:
+    # Map directly to a horizontal canvas of OUT_W x OUT_H
+    dst = np.array([
+        [0, 0],
+        [OUT_W - 1, 0],
+        [OUT_W - 1, OUT_H - 1],
+        [0, OUT_H - 1]
+    ], dtype="float32")
+    # Perspective Warp Transformation
+    M = cv2.getPerspectiveTransform(src, dst)
+    warp = cv2.warpPerspective(img, M, (OUT_W, OUT_H))
 
 
 debug = img.copy()

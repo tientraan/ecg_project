@@ -186,15 +186,7 @@ def order_points(pts):
     return np.array([tl, tr, br, bl], dtype="float32")
 
 
-def fix_ecg_orientation(warp):
-    """Automatically rotate image 90 degrees if height exceeds width."""
-    h, w = warp.shape[:2]
-    if h > w:
-        warp = cv2.rotate(warp, cv2.ROTATE_90_CLOCKWISE)
-    return warp
-
-
-def process_ecg(img_bgr):
+def process_ecg(img_bgr, rotation_mode="Tự động căn chỉnh"):
     """Detect ECG paper, extract contour, apply perspective wrap, and return debug and warped images."""
     model = load_model()
     results = model(img_bgr)
@@ -238,19 +230,52 @@ def process_ecg(img_bgr):
     box = np.array(box, dtype=np.float32)
     
     src = order_points(box)
+    tl, tr, br, bl = src
     
-    # Standard output canvas coordinates
-    dst = np.array([
-        [0, 0],
-        [OUT_W - 1, 0],
-        [OUT_W - 1, OUT_H - 1],
-        [0, OUT_H - 1]
-    ], dtype="float32")
+    # Calculate physical width and height from the detected box to check portrait vs landscape
+    width_top = np.linalg.norm(tr - tl)
+    width_bottom = np.linalg.norm(br - bl)
+    height_left = np.linalg.norm(bl - tl)
+    height_right = np.linalg.norm(br - tr)
     
-    # Perspective Warp Transformation
-    M = cv2.getPerspectiveTransform(src, dst)
-    warp = cv2.warpPerspective(img_bgr, M, (OUT_W, OUT_H))
-    warp = fix_ecg_orientation(warp)
+    box_width = max(width_top, width_bottom)
+    box_height = max(height_left, height_right)
+    
+    is_vertical = box_height > box_width
+    
+    if is_vertical:
+        # Map to a vertical canvas of OUT_H x OUT_W to avoid squishing
+        dst = np.array([
+            [0, 0],
+            [OUT_H - 1, 0],
+            [OUT_H - 1, OUT_W - 1],
+            [0, OUT_W - 1]
+        ], dtype="float32")
+        # Perspective Warp Transformation
+        M = cv2.getPerspectiveTransform(src, dst)
+        warp = cv2.warpPerspective(img_bgr, M, (OUT_H, OUT_W))
+    else:
+        # Map directly to a horizontal canvas of OUT_W x OUT_H
+        dst = np.array([
+            [0, 0],
+            [OUT_W - 1, 0],
+            [OUT_W - 1, OUT_H - 1],
+            [0, OUT_H - 1]
+        ], dtype="float32")
+        # Perspective Warp Transformation
+        M = cv2.getPerspectiveTransform(src, dst)
+        warp = cv2.warpPerspective(img_bgr, M, (OUT_W, OUT_H))
+    
+    # Rotate the warped image based on user selected mode
+    if rotation_mode == "Tự động căn chỉnh":
+        if is_vertical:
+            warp = cv2.rotate(warp, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif rotation_mode == "Xoay 90° xuôi chiều kim đồng hồ":
+        warp = cv2.rotate(warp, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation_mode == "Xoay 90° ngược chiều kim đồng hồ":
+        warp = cv2.rotate(warp, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif rotation_mode == "Xoay 180°":
+        warp = cv2.rotate(warp, cv2.ROTATE_180)
     
     # Draw original image debug overlays
     debug = img_bgr.copy()
@@ -273,6 +298,21 @@ def process_ecg(img_bgr):
 
 # Sidebar Information & Documentation
 with st.sidebar:
+    st.markdown("### ⚙️ Cấu hình căn chỉnh")
+    rotation_mode = st.selectbox(
+        "🔄 Chiều xoay ảnh kết quả",
+        options=[
+            "Tự động căn chỉnh",
+            "Không xoay",
+            "Xoay 90° xuôi chiều kim đồng hồ",
+            "Xoay 90° ngược chiều kim đồng hồ",
+            "Xoay 180°"
+        ],
+        index=0,
+        help="Chọn chiều xoay mong muốn cho ảnh kết quả. Chế độ Tự động sẽ nhận diện nếu ảnh dọc và tự động xoay ngang chuẩn tỷ lệ."
+    )
+    
+    st.markdown("---")
     st.markdown("### 📋 Hướng dẫn sử dụng")
     st.info(
         "1. **Tải ảnh lên**: Chọn file ảnh chụp giấy điện tâm đồ (ECG).\n"
@@ -309,12 +349,13 @@ if uploaded_file is not None:
     # Initialize session state cache if not existing
     if "last_processed_hash" not in st.session_state:
         st.session_state.last_processed_hash = ""
+        st.session_state.last_rotation_mode = ""
         st.session_state.debug_rgb = None
         st.session_state.warp_rgb = None
         st.session_state.download_bytes = None
     
-    # If it is a new image, run processing and cache it
-    if st.session_state.last_processed_hash != file_hash:
+    # If it is a new image or rotation mode changed, run processing and cache it
+    if st.session_state.last_processed_hash != file_hash or st.session_state.last_rotation_mode != rotation_mode:
         with st.spinner("🧠 Hệ thống đang xử lý và phân tách ECG bằng AI..."):
             try:
                 # Open image and convert to OpenCV format
@@ -322,8 +363,8 @@ if uploaded_file is not None:
                 img_rgb = np.array(image)
                 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
                 
-                # Core processing
-                debug_bgr, warp_bgr = process_ecg(img_bgr)
+                # Core processing with user selected rotation mode
+                debug_bgr, warp_bgr = process_ecg(img_bgr, rotation_mode=rotation_mode)
                 
                 # Convert back to RGB for Streamlit rendering
                 debug_rgb = cv2.cvtColor(debug_bgr, cv2.COLOR_BGR2RGB)
@@ -335,6 +376,7 @@ if uploaded_file is not None:
                 
                 # Save to session state
                 st.session_state.last_processed_hash = file_hash
+                st.session_state.last_rotation_mode = rotation_mode
                 st.session_state.debug_rgb = debug_rgb
                 st.session_state.warp_rgb = warp_rgb
                 st.session_state.download_bytes = warp_bytes
