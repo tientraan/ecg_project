@@ -186,7 +186,7 @@ def order_points(pts):
     return np.array([tl, tr, br, bl], dtype="float32")
 
 
-def process_ecg(img_bgr, rotation_mode="Tự động căn chỉnh"):
+def process_ecg(img_bgr, rotation_mode="Tự động xoay ngang (90° xuôi chiều)"):
     """Detect ECG paper, extract contour, apply perspective wrap, and return debug and warped images."""
     model = load_model()
     results = model(img_bgr)
@@ -267,7 +267,10 @@ def process_ecg(img_bgr, rotation_mode="Tự động căn chỉnh"):
         warp = cv2.warpPerspective(img_bgr, M, (OUT_W, OUT_H))
     
     # Rotate the warped image based on user selected mode
-    if rotation_mode == "Tự động căn chỉnh":
+    if rotation_mode == "Tự động căn chỉnh" or rotation_mode == "Tự động xoay ngang (90° xuôi chiều)":
+        if is_vertical:
+            warp = cv2.rotate(warp, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation_mode == "Tự động xoay ngang (90° ngược chiều)":
         if is_vertical:
             warp = cv2.rotate(warp, cv2.ROTATE_90_COUNTERCLOCKWISE)
     elif rotation_mode == "Xoay 90° xuôi chiều kim đồng hồ":
@@ -302,14 +305,15 @@ with st.sidebar:
     rotation_mode = st.selectbox(
         "🔄 Chiều xoay ảnh kết quả",
         options=[
-            "Tự động căn chỉnh",
+            "Tự động xoay ngang (90° xuôi chiều)",
+            "Tự động xoay ngang (90° ngược chiều)",
             "Không xoay",
             "Xoay 90° xuôi chiều kim đồng hồ",
             "Xoay 90° ngược chiều kim đồng hồ",
             "Xoay 180°"
         ],
         index=0,
-        help="Chọn chiều xoay mong muốn cho ảnh kết quả. Chế độ Tự động sẽ nhận diện nếu ảnh dọc và tự động xoay ngang chuẩn tỷ lệ."
+        help="Chọn chiều xoay mong muốn cho ảnh kết quả. Các chế độ Tự động xoay ngang sẽ tự động nhận dạng ảnh dọc và xoay ngang về tỷ lệ chuẩn."
     )
     
     st.markdown("---")
@@ -351,8 +355,12 @@ if uploaded_file is not None:
         st.session_state.last_processed_hash = ""
         st.session_state.last_rotation_mode = ""
         st.session_state.debug_rgb = None
-        st.session_state.warp_rgb = None
-        st.session_state.download_bytes = None
+        st.session_state.base_warp_bgr = None
+        st.session_state.user_rotation = 0
+    
+    # If it is a new image, reset user rotation
+    if st.session_state.last_processed_hash != file_hash:
+        st.session_state.user_rotation = 0
     
     # If it is a new image or rotation mode changed, run processing and cache it
     if st.session_state.last_processed_hash != file_hash or st.session_state.last_rotation_mode != rotation_mode:
@@ -368,18 +376,12 @@ if uploaded_file is not None:
                 
                 # Convert back to RGB for Streamlit rendering
                 debug_rgb = cv2.cvtColor(debug_bgr, cv2.COLOR_BGR2RGB)
-                warp_rgb = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2RGB)
-                
-                # In-memory image encoding for secure concurrent download
-                _, buffer = cv2.imencode(".jpg", warp_bgr)
-                warp_bytes = buffer.tobytes()
                 
                 # Save to session state
                 st.session_state.last_processed_hash = file_hash
                 st.session_state.last_rotation_mode = rotation_mode
                 st.session_state.debug_rgb = debug_rgb
-                st.session_state.warp_rgb = warp_rgb
-                st.session_state.download_bytes = warp_bytes
+                st.session_state.base_warp_bgr = warp_bgr
                 
             except Exception as e:
                 st.error(f"❌ Có lỗi xảy ra trong quá trình xử lý: {str(e)}")
@@ -387,6 +389,21 @@ if uploaded_file is not None:
     # If processing succeeded, render results
     if st.session_state.last_processed_hash == file_hash and st.session_state.debug_rgb is not None:
         st.markdown("<br>", unsafe_allow_html=True)
+        
+        # Apply user rotation on top of base warped image
+        warp_bgr = st.session_state.base_warp_bgr.copy()
+        if st.session_state.user_rotation == 90:
+            warp_bgr = cv2.rotate(warp_bgr, cv2.ROTATE_90_CLOCKWISE)
+        elif st.session_state.user_rotation == 180:
+            warp_bgr = cv2.rotate(warp_bgr, cv2.ROTATE_180)
+        elif st.session_state.user_rotation == 270:
+            warp_bgr = cv2.rotate(warp_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            
+        warp_rgb = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2RGB)
+        
+        # In-memory image encoding for secure concurrent download
+        _, buffer = cv2.imencode(".jpg", warp_bgr)
+        download_bytes = buffer.tobytes()
         
         # Dual-column presentation
         col1, col2 = st.columns(2)
@@ -400,14 +417,30 @@ if uploaded_file is not None:
         with col2:
             st.markdown("<div class='css-card'>", unsafe_allow_html=True)
             st.subheader("📐 Kết quả duỗi phẳng (Warped)")
-            st.image(st.session_state.warp_rgb, use_container_width=True)
+            st.image(warp_rgb, use_container_width=True)
+            
+            # Premium Quick Rotation Buttons on main page
+            st.markdown("<p style='margin-top: 15px; margin-bottom: 5px; font-weight: 500; font-size: 0.9rem; color: #A0AEC0;'>🔄 Xoay nhanh kết quả:</p>", unsafe_allow_html=True)
+            col_btn1, col_btn2, col_btn3 = st.columns(3)
+            with col_btn1:
+                if st.button("↪️ Xoay Trái 90°", key="rot_ccw", use_container_width=True):
+                    st.session_state.user_rotation = (st.session_state.user_rotation - 90) % 360
+                    st.rerun()
+            with col_btn2:
+                if st.button("🔁 Xoay 180°", key="rot_180", use_container_width=True):
+                    st.session_state.user_rotation = (st.session_state.user_rotation + 180) % 360
+                    st.rerun()
+            with col_btn3:
+                if st.button("↩️ Xoay Phải 90°", key="rot_cw", use_container_width=True):
+                    st.session_state.user_rotation = (st.session_state.user_rotation + 90) % 360
+                    st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
             
         # Download Section
         st.markdown("<div style='max-width: 400px; margin: 0 auto;'>", unsafe_allow_html=True)
         st.download_button(
             label="💾 Tải ảnh ECG đã căn chỉnh (.jpg)",
-            data=st.session_state.download_bytes,
+            data=download_bytes,
             file_name=f"ecg_warped_{file_hash[:8]}.jpg",
             mime="image/jpeg"
         )

@@ -6,7 +6,7 @@ from ultralytics import YOLO
 # CONFIG
 # =========================
 MODEL_PATH = "runs/segment/ecg_seg-2/weights/best.pt"
-IMG_PATH = "test.jpg"
+IMG_PATH = "img4.jpg"
 
 OUT_W = 1600
 OUT_H = 600
