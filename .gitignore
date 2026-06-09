@@ -4,4 +4,4 @@ __pycache__/
 runs/detect/
 runs/segment/predict/
 venv311/
-*.pkl
+*.pyc
