@@ -5,11 +5,37 @@ from ultralytics import YOLO
 from PIL import Image
 import os
 import hashlib
+import sys
+import tempfile
+import subprocess
+import importlib.util
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "runs", "segment", "ecg_seg-2", "weights", "best.pt")
 OUT_W = 1600
 OUT_H = 600
+
+# ==================================================================
+# DEWARPNET CONFIG
+# ==================================================================
+# Đặt repo DewarpNet vào thư mục project, ví dụ:
+# ecg_project/
+#   app.py
+#   DewarpNet/
+#     infer.py
+#     eval/models/unetnc_doc3d.pkl
+#     eval/models/dnetccnl_doc3d.pkl
+#
+# Nếu infer.py gốc của bạn không hỗ trợ --input_path/--output_path,
+# tạo file dewarpnet_adapter.py cạnh app.py và định nghĩa hàm:
+#   def dewarp_bgr(img_bgr, wc_model_path, bm_model_path, device="cpu"):
+#       return output_bgr
+DEWARPNET_DIR = os.path.join(BASE_DIR, "DewarpNet")
+DEWARPNET_INFER_PY = os.path.join(DEWARPNET_DIR, "infer.py")
+DEWARPNET_ADAPTER_PY = os.path.join(BASE_DIR, "dewarpnet_adapter.py")
+DEWARPNET_WC_MODEL = os.path.join(DEWARPNET_DIR, "eval", "models", "unetnc_doc3d_final.pkl")
+DEWARPNET_BM_MODEL = os.path.join(DEWARPNET_DIR, "eval", "models", "dnetccnl_doc3d_final.pkl")
+DEWARPNET_DEVICE = "cpu"  # hiện bạn đã test thành công với torch CPU
 
 st.set_page_config(
     page_title="ECG Digitizer AI - Paper Detection & Warp",
@@ -252,6 +278,114 @@ def process_ecg(img_bgr, rotation_mode="Tự động xoay ngang (90° xuôi chi�
 
 
 # ==================================================================
+# DEWARPNET FUNCTIONS
+# ==================================================================
+
+def _load_dewarpnet_adapter():
+    """Load adapter nếu bạn tự viết wrapper cho DewarpNet."""
+    if not os.path.exists(DEWARPNET_ADAPTER_PY):
+        return None
+    spec = importlib.util.spec_from_file_location("dewarpnet_adapter", DEWARPNET_ADAPTER_PY)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "dewarp_bgr"):
+        raise RuntimeError("dewarpnet_adapter.py phải có hàm dewarp_bgr(img_bgr, wc_model_path, bm_model_path, device).")
+    return module.dewarp_bgr
+
+
+def dewarpnet_flatten(img_bgr):
+    """
+    Chạy DewarpNet sau bước YOLO + perspective warp.
+
+    Repo DewarpNet bạn đang dùng nhận input theo THƯ MỤC:
+        --img_path <folder>
+        --out_path <folder>
+
+    Vì vậy app sẽ:
+    1. Ghi ảnh warp vào thư mục tạm.
+    2. Gọi DewarpNet/infer.py bằng subprocess.
+    3. Đọc file output cùng tên từ thư mục output tạm.
+    4. Nếu lỗi thì trả lại ảnh warp gốc để app không crash.
+    """
+    try:
+        if not os.path.exists(DEWARPNET_INFER_PY):
+            return img_bgr, f"Không thấy infer.py: {DEWARPNET_INFER_PY}"
+        if not os.path.exists(DEWARPNET_WC_MODEL):
+            return img_bgr, f"Không thấy Shape model: {DEWARPNET_WC_MODEL}"
+        if not os.path.exists(DEWARPNET_BM_MODEL):
+            return img_bgr, f"Không thấy BM model: {DEWARPNET_BM_MODEL}"
+
+        # Nếu sau này bạn tự viết adapter thì app vẫn ưu tiên adapter.
+        adapter = _load_dewarpnet_adapter()
+        if adapter is not None:
+            out = adapter(
+                img_bgr.copy(),
+                wc_model_path=DEWARPNET_WC_MODEL,
+                bm_model_path=DEWARPNET_BM_MODEL,
+                device=DEWARPNET_DEVICE
+            )
+            if out is None:
+                return img_bgr, "Adapter DewarpNet trả về None. Đã dùng ảnh warp thay thế."
+            out = cv2.resize(out, (img_bgr.shape[1], img_bgr.shape[0]), interpolation=cv2.INTER_CUBIC)
+            return out, "DewarpNet adapter OK."
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_dir = os.path.join(tmpdir, "inp")
+            output_dir = os.path.join(tmpdir, "uw")
+            os.makedirs(input_dir, exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
+
+            input_name = "ecg_warped.jpg"
+            input_path = os.path.join(input_dir, input_name)
+            output_path = os.path.join(output_dir, input_name)
+            cv2.imwrite(input_path, img_bgr)
+
+            cmd = [
+                sys.executable, DEWARPNET_INFER_PY,
+                "--wc_model_path", DEWARPNET_WC_MODEL,
+                "--bm_model_path", DEWARPNET_BM_MODEL,
+                "--img_path", input_dir,
+                "--out_path", output_dir,
+            ]
+
+            proc = subprocess.run(
+                cmd,
+                cwd=DEWARPNET_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=240
+            )
+
+            if proc.returncode != 0:
+                msg = proc.stderr.strip() or proc.stdout.strip() or "DewarpNet infer.py lỗi không rõ."
+                return img_bgr, "DewarpNet lỗi, đã dùng ảnh warp thay thế: " + msg[-700:]
+
+            if not os.path.exists(output_path):
+                # fallback: tìm bất kỳ ảnh nào trong output_dir
+                candidates = [
+                    os.path.join(output_dir, f)
+                    for f in os.listdir(output_dir)
+                    if f.lower().endswith((".jpg", ".jpeg", ".png"))
+                ]
+                if not candidates:
+                    return img_bgr, "DewarpNet chạy xong nhưng không tạo output. Đã dùng ảnh warp thay thế."
+                output_path = candidates[0]
+
+            out = cv2.imread(output_path)
+            if out is None:
+                return img_bgr, "Không đọc được output DewarpNet. Đã dùng ảnh warp thay thế."
+
+            out = cv2.resize(out, (img_bgr.shape[1], img_bgr.shape[0]), interpolation=cv2.INTER_CUBIC)
+            return out, "DewarpNet OK. Nếu ảnh bị méo, hãy tắt checkbox DewarpNet."
+
+    except subprocess.TimeoutExpired:
+        return img_bgr, "DewarpNet quá thời gian xử lý. Đã dùng ảnh warp thay thế."
+    except Exception as e:
+        return img_bgr, f"DewarpNet exception, đã dùng ảnh warp thay thế: {e}"
+
+
+# ==================================================================
 # ENHANCE FUNCTIONS — VIẾT LẠI HOÀN TOÀN
 # ==================================================================
 
@@ -450,6 +584,12 @@ with st.sidebar:
         index=0
     )
 
+    use_dewarpnet = st.checkbox(
+        "📄 Thêm ảnh làm phẳng bằng DewarpNet",
+        value=True,
+        help="Chạy DewarpNet sau bước YOLO crop + Perspective Warp để xử lý cong giấy. Cần có repo/model DewarpNet trong project."
+    )
+
     st.markdown("---")
     st.markdown("### ✨ Cấu hình làm rõ nét")
 
@@ -535,13 +675,17 @@ with tab1:
             st.session_state.last_rotation_mode = ""
             st.session_state.debug_rgb = None
             st.session_state.base_warp_bgr = None
+            st.session_state.base_dewarp_bgr = None
+            st.session_state.dewarp_status = ""
+            st.session_state.last_use_dewarpnet = None
             st.session_state.user_rotation = 0
 
         if st.session_state.last_processed_hash != file_hash:
             st.session_state.user_rotation = 0
 
         if (st.session_state.last_processed_hash != file_hash
-                or st.session_state.last_rotation_mode != rotation_mode):
+                or st.session_state.last_rotation_mode != rotation_mode
+                or st.session_state.last_use_dewarpnet != use_dewarpnet):
             with st.spinner("🧠 Hệ thống đang xử lý và phân tách ECG bằng AI..."):
                 try:
                     image = Image.open(uploaded_file).convert("RGB")
@@ -549,10 +693,19 @@ with tab1:
                     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
                     debug_bgr, warp_bgr = process_ecg(img_bgr, rotation_mode=rotation_mode)
                     debug_rgb = cv2.cvtColor(debug_bgr, cv2.COLOR_BGR2RGB)
+
+                    dewarp_bgr = None
+                    dewarp_status = "DewarpNet tắt."
+                    if use_dewarpnet:
+                        dewarp_bgr, dewarp_status = dewarpnet_flatten(warp_bgr)
+
                     st.session_state.last_processed_hash = file_hash
                     st.session_state.last_rotation_mode = rotation_mode
+                    st.session_state.last_use_dewarpnet = use_dewarpnet
                     st.session_state.debug_rgb = debug_rgb
                     st.session_state.base_warp_bgr = warp_bgr
+                    st.session_state.base_dewarp_bgr = dewarp_bgr
+                    st.session_state.dewarp_status = dewarp_status
                 except Exception as e:
                     st.error(f"❌ Có lỗi xảy ra trong quá trình xử lý: {str(e)}")
 
@@ -570,11 +723,24 @@ with tab1:
             elif st.session_state.user_rotation == 270:
                 warp_bgr = cv2.rotate(warp_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
+            dewarp_bgr = None
+            if use_dewarpnet and st.session_state.base_dewarp_bgr is not None:
+                dewarp_bgr = st.session_state.base_dewarp_bgr.copy()
+                if st.session_state.user_rotation == 90:
+                    dewarp_bgr = cv2.rotate(dewarp_bgr, cv2.ROTATE_90_CLOCKWISE)
+                elif st.session_state.user_rotation == 180:
+                    dewarp_bgr = cv2.rotate(dewarp_bgr, cv2.ROTATE_180)
+                elif st.session_state.user_rotation == 270:
+                    dewarp_bgr = cv2.rotate(dewarp_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
             warp_rgb = cv2.cvtColor(warp_bgr, cv2.COLOR_BGR2RGB)
             _, buffer = cv2.imencode(".jpg", warp_bgr)
             download_bytes = buffer.tobytes()
 
-            col1, col2 = st.columns(2)
+            if use_dewarpnet:
+                col1, col2, col3 = st.columns(3)
+            else:
+                col1, col2 = st.columns(2)
             with col1:
                 st.markdown("<div class='css-card'>", unsafe_allow_html=True)
                 st.subheader("🎯 Nhận diện giấy ECG")
@@ -604,6 +770,27 @@ with tab1:
                         st.session_state.user_rotation = (st.session_state.user_rotation + 90) % 360
                         st.rerun()
                 st.markdown("</div>", unsafe_allow_html=True)
+
+            if use_dewarpnet:
+                with col3:
+                    st.markdown("<div class='css-card'>", unsafe_allow_html=True)
+                    st.subheader("📄 DewarpNet Flatten")
+                    if dewarp_bgr is not None:
+                        dewarp_rgb = cv2.cvtColor(dewarp_bgr, cv2.COLOR_BGR2RGB)
+                        st.image(dewarp_rgb, use_container_width=True)
+                        st.caption(st.session_state.dewarp_status)
+
+                        _, dewarp_buffer = cv2.imencode(".jpg", dewarp_bgr)
+                        st.download_button(
+                            label="💾 Tải ảnh DewarpNet flatten (.jpg)",
+                            data=dewarp_buffer.tobytes(),
+                            file_name=f"ecg_dewarpnet_{file_hash[:8]}.jpg",
+                            mime="image/jpeg",
+                            key="download_dewarpnet"
+                        )
+                    else:
+                        st.warning(st.session_state.dewarp_status or "Không có kết quả DewarpNet.")
+                    st.markdown("</div>", unsafe_allow_html=True)
 
             st.markdown("<div style='max-width: 400px; margin: 0 auto;'>", unsafe_allow_html=True)
             st.download_button(

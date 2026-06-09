@@ -3,3 +3,5 @@ __pycache__/
 *.cache
 runs/detect/
 runs/segment/predict/
+venv311/
+*.pkl
